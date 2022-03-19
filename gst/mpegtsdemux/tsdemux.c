@@ -63,6 +63,9 @@
 #define CONTINUITY_UNSET 255
 #define MAX_CONTINUITY 15
 
+/* Length of metadata_AU_cell header, see ISO/IEC 13818-1:2018 Section 2.12.4 */
+#define PES_PACKET_METADATA_AU_HEADER_LEN 5
+
 /* Seeking/Scanning related variables */
 
 /* seek to SEEK_TIMESTAMP_OFFSET before the desired offset and search then
@@ -1002,6 +1005,68 @@ push_event (MpegTSBase * base, GstEvent * event)
   return TRUE;
 }
 
+static GstBufferList *
+parse_pes_metadata_frame (TSDemuxStream * stream)
+{
+  GstByteReader reader;
+  GstBufferList *buffer_list = NULL;
+
+  buffer_list = gst_buffer_list_new ();
+  gst_byte_reader_init (&reader, stream->data, stream->current_size);
+
+  do {
+    GstBuffer *buffer;
+    guint8 *au_data;
+    guint16 au_size;
+    guint8 service_id;
+    guint8 sequence_number;
+    guint8 flags;
+
+    if (gst_byte_reader_get_remaining (&reader) <
+        PES_PACKET_METADATA_AU_HEADER_LEN)
+      goto error;
+
+    if (!gst_byte_reader_get_uint8 (&reader, &service_id))
+      goto error;
+
+    if (!gst_byte_reader_get_uint8 (&reader, &sequence_number))
+      goto error;
+
+    if (!gst_byte_reader_get_uint8 (&reader, &flags))
+      goto error;
+
+    if (!gst_byte_reader_get_uint16_be (&reader, &au_size))
+      goto error;
+
+    if (gst_byte_reader_get_remaining (&reader) < au_size)
+      goto error;
+
+    if (!gst_byte_reader_dup_data (&reader, au_size, &au_data))
+      goto error;
+
+    buffer = gst_buffer_new_wrapped (au_data, au_size);
+
+    gst_buffer_list_add (buffer_list, buffer);
+  } while (gst_byte_reader_get_remaining (&reader) > 0);
+
+  g_free (stream->data);
+  stream->data = NULL;
+  stream->current_size = 0;
+
+  return buffer_list;
+
+error:
+  {
+    GST_ERROR ("Failed to parse PES metadata access units");
+    g_free (stream->data);
+    stream->data = NULL;
+    stream->current_size = 0;
+    if (buffer_list)
+      gst_buffer_list_unref (buffer_list);
+    return NULL;
+  }
+}
+
 static inline void
 add_iso639_language_to_tags (TSDemuxStream * stream, gchar * lang_code)
 {
@@ -1169,6 +1234,27 @@ create_pad_for_stream (MpegTSBase * base, MpegTSBaseStream * bstream,
       /* HDV is always mpeg 1 audio layer 2 */
       if (program->registration_id == DRF_ID_TSHV)
         gst_caps_set_simple (caps, "layer", G_TYPE_INT, 2, NULL);
+      break;
+    case GST_MPEGTS_STREAM_TYPE_METADATA_PES_PACKETS:
+      GST_LOG ("metadata pes");
+      desc = mpegts_get_descriptor_from_stream (bstream, GST_MTS_DESC_METADATA);
+      if (desc) {
+        int application_format = DESC_METADATA_application_format (desc->data);
+        if ((DESC_METADATA_format (desc->data) ==
+                DESC_METADATA_format_identifier_PRESENT)
+            && (DESC_METADATA_format_identifier (desc->data) == DRF_ID_KLVA)) {
+          sparse = TRUE;
+          is_private = TRUE;
+          /* registration_id is not correctly set or parsed for some streams */
+          bstream->registration_id = DRF_ID_KLVA;
+
+          caps = gst_caps_new_simple ("meta/x-klv",
+              "parsed", G_TYPE_BOOLEAN, TRUE,
+              "stream-type", G_TYPE_INT, bstream->stream_type,
+              "application-format", G_TYPE_INT, application_format,
+              "format", G_TYPE_INT, DESC_METADATA_format (desc->data), NULL);
+        }
+      }
       break;
     case GST_MPEGTS_STREAM_TYPE_PRIVATE_PES_PACKETS:
       GST_LOG ("private data");
@@ -2862,15 +2948,16 @@ gst_ts_demux_push_pending_data (GstTSDemux * demux, TSDemuxStream * stream,
           res = GST_FLOW_ERROR;
           goto beach;
         }
-
-        if (gst_buffer_list_length (buffer_list) == 1) {
-          buffer = gst_buffer_ref (gst_buffer_list_get (buffer_list, 0));
-          gst_buffer_list_unref (buffer_list);
-          buffer_list = NULL;
-        }
       } else if (bs->stream_type == GST_MPEGTS_STREAM_TYPE_VIDEO_JP2K) {
         buffer = parse_jp2k_access_unit (stream);
         if (!buffer) {
+          res = GST_FLOW_ERROR;
+          goto beach;
+        }
+      } else if (bs->stream_type == GST_MPEGTS_STREAM_TYPE_METADATA_PES_PACKETS
+          && bs->registration_id == DRF_ID_KLVA) {
+        buffer_list = parse_pes_metadata_frame (stream);
+        if (!buffer_list) {
           res = GST_FLOW_ERROR;
           goto beach;
         }
@@ -2902,15 +2989,16 @@ gst_ts_demux_push_pending_data (GstTSDemux * demux, TSDemuxStream * stream,
         res = GST_FLOW_ERROR;
         goto beach;
       }
-
-      if (gst_buffer_list_length (buffer_list) == 1) {
-        buffer = gst_buffer_ref (gst_buffer_list_get (buffer_list, 0));
-        gst_buffer_list_unref (buffer_list);
-        buffer_list = NULL;
-      }
     } else if (bs->stream_type == GST_MPEGTS_STREAM_TYPE_VIDEO_JP2K) {
       buffer = parse_jp2k_access_unit (stream);
       if (!buffer) {
+        res = GST_FLOW_ERROR;
+        goto beach;
+      }
+    } else if (bs->stream_type == GST_MPEGTS_STREAM_TYPE_METADATA_PES_PACKETS
+        && bs->registration_id == DRF_ID_KLVA) {
+      buffer_list = parse_pes_metadata_frame (stream);
+      if (!buffer_list) {
         res = GST_FLOW_ERROR;
         goto beach;
       }
@@ -2943,6 +3031,12 @@ gst_ts_demux_push_pending_data (GstTSDemux * demux, TSDemuxStream * stream,
       GST_DEBUG ("Not enough information to push buffers yet, storing buffer");
       goto beach;
     }
+  }
+
+  if (buffer_list != NULL && gst_buffer_list_length (buffer_list) == 1) {
+    buffer = gst_buffer_ref (gst_buffer_list_get (buffer_list, 0));
+    gst_buffer_list_unref (buffer_list);
+    buffer_list = NULL;
   }
 
   if (G_UNLIKELY (stream->need_newsegment))
